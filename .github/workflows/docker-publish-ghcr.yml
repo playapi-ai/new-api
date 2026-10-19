@@ -12,41 +12,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare:
-    name: Prepare image version
+  build:
+    name: Build and publish (amd64)
     runs-on: ubuntu-latest
-    outputs:
-      image: ${{ steps.version.outputs.image }}
-      version: ${{ steps.version.outputs.version }}
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Resolve image name and version
-        id: version
         shell: bash
         run: |
           IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
           VERSION="fork-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA:0:12}"
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
-  build:
-    name: Build and push (${{ matrix.arch }})
-    needs: prepare
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
-    env:
-      IMAGE: ${{ needs.prepare.outputs.image }}
-      VERSION: ${{ needs.prepare.outputs.version }}
-    steps:
       - name: Check out selected commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -70,45 +50,19 @@ jobs:
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          platforms: linux/${{ matrix.arch }}
+          platforms: linux/amd64
           push: true
-          tags: ${{ env.IMAGE }}:${{ env.VERSION }}-${{ matrix.arch }}
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:latest
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ env.VERSION }}
-          cache-from: type=gha,scope=ghcr-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=ghcr-${{ matrix.arch }}
+          cache-from: type=gha,scope=ghcr-amd64
+          cache-to: type=gha,mode=max,scope=ghcr-amd64
           provenance: mode=max
           sbom: true
-
-  publish:
-    name: Publish multi-arch image
-    needs: [prepare, build]
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    env:
-      IMAGE: ${{ needs.prepare.outputs.image }}
-      VERSION: ${{ needs.prepare.outputs.version }}
-    steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
-
-      - name: Log in to GHCR
-        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish version and latest tags
-        run: |
-          docker buildx imagetools create \
-            --tag "$IMAGE:$VERSION" \
-            --tag "$IMAGE:latest" \
-            "$IMAGE:$VERSION-amd64" \
-            "$IMAGE:$VERSION-arm64"
 
       - name: Show published image
         run: |
@@ -119,7 +73,7 @@ jobs:
             echo "- Version: \`$IMAGE:$VERSION\`"
             echo "- Latest: \`$IMAGE:latest\`"
             echo "- Commit: \`$GITHUB_SHA\`"
-            echo '- Platforms: linux/amd64, linux/arm64'
+            echo '- Platform: linux/amd64'
             echo
             echo 'Use the version tag in your Compose file to pin this release:'
             echo '```yaml'
