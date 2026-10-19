@@ -426,15 +426,29 @@ func (a *Adaptor) ConvertOpenAIRequest(c *gin.Context, info *relaycommon.RelayIn
 			request.MaxTokens = nil
 		}
 	}
-	if !capabilities.SupportsTemperature {
-		request.Temperature = nil
+	// Paired Azure Chat tests for these models showed that filtering both
+	// removes supported logprobs and hides upstream parameter errors. Preserve
+	// explicit fields and let Azure validate them; this is not a capability
+	// claim. Keep other providers, model variants and conversions unchanged.
+	preserveAzureChatParameters := false
+	if info.ChannelType == constant.ChannelTypeAzure && info.RelayFormat == types.RelayFormatOpenAI &&
+		info.RelayMode == relayconstant.RelayModeChatCompletions && len(info.RequestConversionChain) <= 1 {
+		switch info.UpstreamModelName {
+		case "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra":
+			preserveAzureChatParameters = true
+		}
 	}
-	if !capabilities.SupportsTopP {
-		request.TopP = nil
-	}
-	if !capabilities.SupportsLogProbs {
-		request.LogProbs = nil
-		request.TopLogProbs = nil
+	if !preserveAzureChatParameters {
+		if !capabilities.SupportsTemperature {
+			request.Temperature = nil
+		}
+		if !capabilities.SupportsTopP {
+			request.TopP = nil
+		}
+		if !capabilities.SupportsLogProbs {
+			request.LogProbs = nil
+			request.TopLogProbs = nil
+		}
 	}
 	if capabilities.UseDeveloperRole && len(request.Messages) > 0 && request.Messages[0].Role == "system" {
 		request.Messages[0].Role = "developer"
