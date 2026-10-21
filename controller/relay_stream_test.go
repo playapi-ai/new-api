@@ -16,9 +16,14 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/pkg/billingexpr"
 	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/claude"
+	"github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -322,4 +327,222 @@ func TestStreamKeepAliveCancellation(t *testing.T) {
 	_, err := c.Writer.WriteString("data: done\n\n")
 	require.NoError(t, err)
 	require.True(t, strings.HasSuffix(recorder.Body.String(), "data: done\n\n"))
+}
+
+// Exercise a real upstream and HTTP client through reservation, streaming,
+// settlement/refund, and log recording, including downstream cancellation.
+func TestOpenAIStreamAccounting(t *testing.T) {
+	const content = `{"id":"chat-test","model":"billing-test","choices":[{"index":0,"delta":{"content":"hello"}}]}`
+	const finish = `{"id":"chat-test","model":"billing-test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`
+	const usage = `{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020,"prompt_tokens_details":{"cached_tokens":900}}}`
+	const empty = `{"choices":[]}`
+	frame := func(data string) string { return "data: " + data + "\n\n" }
+	for _, tc := range []struct {
+		name, body  string
+		cut, cancel bool
+		want        int
+		tokens      bool
+	}{
+		{name: "empty"},
+		{name: "done only", body: frame("[DONE]")},
+		{name: "error only", body: frame(`{"error":{"message":"upstream failed","type":"server_error"}}`) + frame("[DONE]")},
+		{name: "error after output", body: frame(content) + frame(`{"error":{"message":"upstream failed"}}`)},
+		{name: "early usage", body: frame(content) + frame(usage) + frame(empty) + frame(finish) + frame("[DONE]"), want: 185, tokens: true},
+		{name: "repeated usage", body: frame(content) + frame(usage) + frame(usage) + frame(finish) + frame("[DONE]"), want: 185, tokens: true},
+		{name: "completed", body: frame(content) + frame(finish) + frame("[DONE]"), want: 1000},
+		{name: "ordinary EOF", body: frame(content) + frame(finish), want: 1000},
+		{name: "read failure", body: frame(content), cut: true},
+		{name: "failure after completion", body: frame(content) + frame(finish), cut: true, want: 1000},
+		{name: "client cancellation", body: frame(content) + frame(empty), cancel: true, want: 1000},
+		{name: "refusal cancellation", body: frame(`{"choices":[{"index":0,"delta":{"refusal":"hello, denied"}}]}`) + frame(empty), cancel: true, want: 1000},
+		{name: "legacy completion", body: frame(`{"choices":[{"index":0,"text":"hello","finish_reason":"stop"}]}`) + frame("[DONE]"), want: 1000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := modelManagementDB(t, "sqlite", "")
+			require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Log{}))
+			oldLog, oldBatch := common.LogConsumeEnabled, common.BatchUpdateEnabled
+			common.LogConsumeEnabled, common.BatchUpdateEnabled = true, false
+			oldTimeout := constant.StreamingTimeout
+			constant.StreamingTimeout = 5
+			t.Cleanup(func() {
+				common.LogConsumeEnabled, common.BatchUpdateEnabled = oldLog, oldBatch
+				constant.StreamingTimeout = oldTimeout
+			})
+			user := model.User{Username: "stream-accounting", Quota: 10000}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: "stream-accounting-key", RemainQuota: 10000}
+			require.NoError(t, db.Create(&token).Error)
+			ch := model.Channel{Name: "stream-accounting", Key: "unused"}
+			require.NoError(t, db.Create(&ch).Error)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				if tc.cut {
+					w.Header().Set("Content-Length", strconv.Itoa(len(tc.body)+100))
+				}
+				_, _ = io.WriteString(w, tc.body)
+				w.(http.Flusher).Flush()
+				if tc.cancel {
+					<-r.Context().Done()
+				}
+			}))
+			defer upstream.Close()
+			done := make(chan struct{})
+			engine := gin.New()
+			engine.POST("/v1/chat/completions", func(c *gin.Context) {
+				defer close(done)
+				expr := `tier("request",fixed(0.002))`
+				if tc.tokens {
+					expr = `tier("token",p * 2 + c * 4 + cr * 0.1)`
+				}
+				info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, OriginModelName: "billing-test", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "billing-test", ChannelId: ch.Id}, StartTime: time.Now(), IsStream: true, ShouldIncludeUsage: true, RelayFormat: types.RelayFormatOpenAI, ForcePreConsume: true, UserSetting: dto.UserSetting{BillingPreference: "wallet_only"}, TieredBillingSnapshot: &billingexpr.BillingSnapshot{BillingMode: "tiered_expr", ExprString: expr, ExprHash: billingexpr.ExprHashString(expr), QuotaPerUnit: common.QuotaPerUnit, GroupRatio: 1, EstimatedQuotaAfterGroup: 2000}}
+				info.SetEstimatePromptTokens(12)
+				if apiErr := service.PreConsumeBilling(c, 2000, info); apiErr != nil {
+					assert.Fail(t, apiErr.Error())
+					return
+				}
+				request, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, upstream.URL, nil)
+				if !assert.NoError(t, err) {
+					return
+				}
+				response, err := http.DefaultClient.Do(request)
+				if !assert.NoError(t, err) {
+					return
+				}
+				actual, apiErr := openai.OaiStreamHandler(c, info, response)
+				if apiErr != nil {
+					info.Billing.Refund(c)
+					return
+				}
+				service.PostTextConsumeQuota(c, info, actual, nil)
+			})
+			gateway := httptest.NewServer(engine)
+			defer gateway.Close()
+			requestCtx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, gateway.URL+"/v1/chat/completions", nil)
+			require.NoError(t, err)
+			client := &http.Client{Timeout: 5 * time.Second}
+			response, err := client.Do(request)
+			require.NoError(t, err)
+			defer response.Body.Close()
+			var received []byte
+			if tc.cancel {
+				reader := bufio.NewReader(response.Body)
+				line, err := reader.ReadString('\n')
+				require.NoError(t, err)
+				require.Contains(t, line, "hello")
+				cancel()
+			} else {
+				received, err = io.ReadAll(response.Body)
+				require.NoError(t, err)
+			}
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("request did not finish")
+			}
+			require.NoError(t, db.First(&user, user.Id).Error)
+			require.NoError(t, db.First(&token, token.Id).Error)
+			assert.Equal(t, 10000-tc.want, user.Quota)
+			assert.Equal(t, 10000-tc.want, token.RemainQuota)
+			assert.Equal(t, tc.want, token.UsedQuota)
+			var logs []model.Log
+			require.NoError(t, db.Where("type = ? AND user_id = ?", model.LogTypeConsume, user.Id).Find(&logs).Error)
+			if tc.want == 0 {
+				assert.Empty(t, logs)
+				assert.NotContains(t, string(received), "[DONE]")
+			} else {
+				require.Len(t, logs, 1)
+				assert.Equal(t, tc.want, logs[0].Quota)
+			}
+			if tc.tokens {
+				assert.Equal(t, 1000, logs[0].PromptTokens)
+				assert.Equal(t, 20, logs[0].CompletionTokens)
+				assert.Contains(t, string(received), `"cached_tokens":900`)
+			}
+		})
+	}
+}
+
+func TestClaudeCacheAccounting(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 5
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+	const expression = `tier("cache", p * 2 + cr * 0.1 + cc * 2.5 + cc1h * 4 + c * 4)`
+	for _, tc := range []struct {
+		name, usage, expr string
+		want              int
+	}{
+		{"aggregate writes", `{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":300}`, expression, 485},
+		{"partial TTL buckets", `{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":300,"cache_creation":{"ephemeral_1h_input_tokens":100}}`, expression, 560},
+		{"split writes only", `{"cache_creation":{"ephemeral_5m_input_tokens":200,"ephemeral_1h_input_tokens":100}}`, expression, 450},
+		{"cache read only", `{"cache_read_input_tokens":200}`, expression, 10},
+		{"omitted cache variables", `{"input_tokens":100,"cache_read_input_tokens":200,"cache_creation_input_tokens":300}`, `tier("input", p * 2)`, 600},
+	} {
+		for _, stream := range []bool{false, true} {
+			for _, format := range []types.RelayFormat{types.RelayFormatClaude, types.RelayFormatOpenAI} {
+				t.Run(tc.name+"/"+strconv.FormatBool(stream)+"/"+string(format), func(t *testing.T) {
+					db := modelManagementDB(t, "sqlite", "")
+					require.NoError(t, db.AutoMigrate(&model.Token{}, &model.Log{}))
+					oldLog, oldBatch := common.LogConsumeEnabled, common.BatchUpdateEnabled
+					common.LogConsumeEnabled, common.BatchUpdateEnabled = true, false
+					t.Cleanup(func() { common.LogConsumeEnabled, common.BatchUpdateEnabled = oldLog, oldBatch })
+					user := model.User{Username: "claude-cache-accounting", Quota: 10000}
+					require.NoError(t, db.Create(&user).Error)
+					token := model.Token{UserId: user.Id, Key: "claude-cache-accounting-key", RemainQuota: 10000}
+					require.NoError(t, db.Create(&token).Error)
+					ch := model.Channel{Name: "claude-cache-accounting", Key: "unused"}
+					require.NoError(t, db.Create(&ch).Error)
+					body := `{"id":"msg-cache","model":"claude-cache-test","type":"message","content":[],"stop_reason":"end_turn","usage":` + tc.usage + `}`
+					if stream {
+						body = "data: " + `{"type":"message_start","message":` + body + "}\n\n" +
+							"data: " + `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}` + "\n\n" +
+							"data: " + `{"type":"message_stop"}` + "\n\n"
+					}
+					upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+						if stream {
+							w.Header().Set("Content-Type", "text/event-stream")
+						}
+						_, _ = io.WriteString(w, body)
+					}))
+					defer upstream.Close()
+					ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+					ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+					info := &relaycommon.RelayInfo{
+						UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, OriginModelName: "claude-cache-test",
+						ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "claude-cache-test", ChannelId: ch.Id},
+						StartTime:   time.Now(), IsStream: stream, ShouldIncludeUsage: true, RelayFormat: format, ForcePreConsume: true,
+						UserSetting: dto.UserSetting{BillingPreference: "wallet_only"},
+						TieredBillingSnapshot: &billingexpr.BillingSnapshot{BillingMode: "tiered_expr", ExprString: tc.expr,
+							ExprHash: billingexpr.ExprHashString(tc.expr), QuotaPerUnit: common.QuotaPerUnit, GroupRatio: 1, EstimatedQuotaAfterGroup: 2000},
+					}
+					require.Nil(t, service.PreConsumeBilling(ctx, 2000, info))
+					response, err := http.Get(upstream.URL)
+					require.NoError(t, err)
+					var usage *dto.Usage
+					var apiErr *types.NewAPIError
+					if stream {
+						usage, apiErr = claude.ClaudeStreamHandler(ctx, response, info)
+					} else {
+						usage, apiErr = claude.ClaudeHandler(ctx, response, info)
+					}
+					require.Nil(t, apiErr)
+					require.NotNil(t, usage)
+					service.PostTextConsumeQuota(ctx, info, usage, nil)
+					require.NoError(t, db.First(&user, user.Id).Error)
+					require.NoError(t, db.First(&token, token.Id).Error)
+					assert.Equal(t, 10000-tc.want, user.Quota)
+					assert.Equal(t, 10000-tc.want, token.RemainQuota)
+					assert.Equal(t, tc.want, token.UsedQuota)
+					var logs []model.Log
+					require.NoError(t, db.Where("type = ? AND user_id = ?", model.LogTypeConsume, user.Id).Find(&logs).Error)
+					require.Len(t, logs, 1)
+					assert.Equal(t, tc.want, logs[0].Quota)
+					var other map[string]any
+					require.NoError(t, common.UnmarshalJsonStr(logs[0].Other, &other))
+					assert.Equal(t, "anthropic", other["usage_semantic"])
+				})
+			}
+		}
+	}
 }

@@ -1092,3 +1092,28 @@ func TestSamePriceCacheReadsRemainInInput(t *testing.T) {
 		})
 	}
 }
+
+func TestClaudeCacheCreationPreservesAggregateAndUnpricedBuckets(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		aggregate, five, one int
+		expr                 string
+		p, cc, cc1h          float64
+	}{
+		{"aggregate only", 300, 0, 0, `tier("base", p + cc)`, 100, 300, 0},
+		{"mixed TTL", 300, 200, 100, `tier("base", p + cc + cc1h)`, 100, 200, 100},
+		{"partial buckets", 300, 0, 100, `tier("base", p + cc + cc1h)`, 100, 200, 100},
+		{"omitted writes", 300, 200, 100, `tier("base", p)`, 400, 200, 100},
+		{"omitted hour", 300, 200, 100, `tier("base", p + cc)`, 200, 200, 100},
+		{"buckets only", 0, 200, 100, `tier("base", p)`, 400, 200, 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			usage := &dto.Usage{PromptTokens: 100, UsageSemantic: "anthropic", ClaudeCacheCreation5mTokens: tc.five, ClaudeCacheCreation1hTokens: tc.one, PromptTokensDetails: dto.InputTokenDetails{CachedCreationTokens: tc.aggregate}}
+			params := BuildTieredTokenParams(usage, true, billingexpr.UsedVars(tc.expr))
+			assert.Equal(t, tc.p, params.P)
+			assert.Equal(t, tc.cc, params.CC)
+			assert.Equal(t, tc.cc1h, params.CC1h)
+			assert.Equal(t, float64(100+max(tc.aggregate, tc.five+tc.one)), params.Len)
+		})
+	}
+}

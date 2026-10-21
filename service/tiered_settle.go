@@ -30,9 +30,10 @@ func BuildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVa
 	cc5m := float64(usage.PromptTokensDetails.CacheCreationTokensTotal())
 	cc1h := float64(0)
 
-	if usage.UsageSemantic == "anthropic" {
-		cc1h = float64(usage.ClaudeCacheCreation1hTokens)
-		cc5m = float64(usage.ClaudeCacheCreation5mTokens)
+	if isClaudeUsageSemantic {
+		cc1h = max(float64(usage.ClaudeCacheCreation1hTokens), 0)
+		// Preserve aggregate-only usage and any unassigned standard-TTL writes.
+		cc5m = max(float64(usage.ClaudeCacheCreation5mTokens), cc5m-cc1h, 0)
 	}
 
 	img := float64(usage.PromptTokensDetails.ImageTokens)
@@ -84,6 +85,12 @@ func BuildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVa
 		// price, merge those tokens into the input category instead.
 		if !usedVars["cr"] {
 			p += cr
+		}
+		if !usedVars["cc"] {
+			p += cc5m
+		}
+		if !usedVars["cc1h"] {
+			p += cc1h
 		}
 	} else {
 		if usedVars["cr"] {

@@ -125,16 +125,32 @@ func OpenaiSTTHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 	service.IOCopyBytesGracefully(c, resp, responseBody)
 
 	var responseData struct {
-		Usage *dto.Usage `json:"usage"`
+		Usage *struct {
+			dto.Usage
+			InputTokenDetails *dto.InputTokenDetails `json:"input_token_details"`
+		} `json:"usage"`
 	}
 	if err := common.Unmarshal(responseBody, &responseData); err == nil && responseData.Usage != nil {
 		if responseData.Usage.TotalTokens > 0 {
-			usage := responseData.Usage
+			usage := &responseData.Usage.Usage
 			if usage.PromptTokens == 0 {
 				usage.PromptTokens = usage.InputTokens
 			}
 			if usage.CompletionTokens == 0 {
 				usage.CompletionTokens = usage.OutputTokens
+			}
+			details := responseData.Usage.InputTokenDetails
+			if details == nil {
+				details = usage.InputTokensDetails
+			}
+			if details != nil {
+				usage.PromptTokensDetails = details.Clone()
+			}
+			if usage.PromptTokensDetails.TextTokens == 0 {
+				usage.PromptTokensDetails.TextTokens = max(usage.PromptTokens-usage.PromptTokensDetails.AudioTokens-usage.PromptTokensDetails.ImageTokens, 0)
+			}
+			if usage.CompletionTokenDetails.TextTokens == 0 {
+				usage.CompletionTokenDetails.TextTokens = max(usage.CompletionTokens-usage.CompletionTokenDetails.AudioTokens-usage.CompletionTokenDetails.ImageTokens, 0)
 			}
 			return nil, usage
 		}

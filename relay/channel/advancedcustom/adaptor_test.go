@@ -2,8 +2,10 @@ package advancedcustom
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -19,6 +21,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -58,6 +61,24 @@ func TestAdaptorUsesExactRouteAndQueryAuth(t *testing.T) {
 // URL, and a channel proxy is dialed before the upstream; a failed handshake
 // must hide both.
 func TestAdaptorMasksDialedHostsInDialFailure(t *testing.T) {
+	// Fail at the actual dial target without depending on DNS or an external
+	// proxy intercepting the reserved .invalid domain.
+	previousDialer := websocket.DefaultDialer
+	dialer := *previousDialer
+	var dialedAddress string
+	dialer.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialedAddress = address
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		if host == "egress.private.invalid" {
+			return nil, &net.OpError{Op: "dial", Net: network, Err: &net.DNSError{Name: host, Err: "no such host", IsNotFound: true}}
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}
+	websocket.DefaultDialer = &dialer
+	t.Cleanup(func() { websocket.DefaultDialer = previousDialer })
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 	}))
@@ -87,6 +108,7 @@ func TestAdaptorMasksDialedHostsInDialFailure(t *testing.T) {
 
 			var apiErr *types.NewAPIError
 			require.ErrorAs(t, err, &apiErr)
+			assert.Contains(t, dialedAddress, tc.hidden)
 			require.Contains(t, apiErr.Error(), tc.hidden)
 			message := apiErr.ToOpenAIError(common.UpstreamAddresses(c)...).Message
 			assert.Contains(t, message, "dial failed to ws://***:"+upstreamURL.Port()+"/***/***")

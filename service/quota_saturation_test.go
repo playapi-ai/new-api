@@ -138,3 +138,15 @@ func TestPreConsumeBillingRejectsNegativeQuotaBeforeDeduction(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, apiErr.StatusCode)
 	require.Nil(t, info.Billing)
 }
+
+func TestQuotaSaturationKeepsLogMetadataSerializable(t *testing.T) {
+	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+		other := model.NewLogOther()
+		other.SetPublic("billing_mode", "tiered_expr")
+		other.SetAdmin("quota_saturation", (&common.QuotaClamp{Original: value, Clamped: common.MaxQuota}).AuditMap())
+		encoded, err := common.Marshal(other)
+		require.NoError(t, err)
+		require.Contains(t, string(encoded), `"billing_mode":"tiered_expr"`)
+		require.Contains(t, string(encoded), `"quota_saturation"`)
+	}
+}

@@ -1,10 +1,17 @@
 package service
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,12 +28,15 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // The configured DSNs must point at isolated test databases. Each dialect runs
@@ -80,7 +90,8 @@ func TestFixedPriceBillingDatabaseMatrix(t *testing.T) {
 			model.DB, model.LOG_DB = db, logDB
 			common.SetDatabaseTypes(dialect.name, dialect.name)
 			t.Cleanup(func() { model.DB, model.LOG_DB = oldDB, oldLogDB; common.SetDatabaseTypes(oldMainType, oldLogType) })
-			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}))
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.BillingOperation{}))
+			require.NoError(t, db.AutoMigrate(&model.BillingOperation{}))
 			require.NoError(t, logDB.AutoMigrate(&model.Log{}))
 			versionQuery := "select version()"
 			if dialect.name == common.DatabaseTypeSQLite {
@@ -90,6 +101,8 @@ func TestFixedPriceBillingDatabaseMatrix(t *testing.T) {
 			require.NoError(t, db.Raw(versionQuery).Scan(&version).Error)
 			t.Logf("database: %s", version)
 			runFixedPriceAccountingCases(t, db, logDB)
+			t.Run("recovery", func(t *testing.T) { runBillingOperationRecoveryCases(t, db) })
+			t.Run("redis_recovery", func(t *testing.T) { runBillingRedisRecoveryCases(t, db) })
 		})
 	}
 }
@@ -1581,4 +1594,487 @@ func TestPostTextConsumeQuotaLogsMissingUsageAsStructuredContent(t *testing.T) {
 	assert.Equal(t, []any{
 		map[string]any{"key": "Upstream returned no usage, so nothing was charged (possibly an upstream timeout)"},
 	}, other["content_parts"])
+}
+
+// Recovery must work after the caller has discarded the request session.
+func runBillingOperationRecoveryCases(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.NoError(t, db.AutoMigrate(&model.SubscriptionPlan{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}))
+	for _, source := range []string{"wallet", "subscription"} {
+		for _, fault := range []string{"funding", "token", "intent", "refund", "reserve_settle", "reserve_refund", "admission_refund", "admission_reply", "admission_rollback", "token_admission_reply", "token_admission_rollback", "commit_reply", "concurrent", "reserve_insufficient"} {
+			t.Run(source+"/"+fault, func(t *testing.T) {
+				user := model.User{Username: "recovery-" + uuid.NewString(), AffCode: uuid.NewString()[:16], Quota: 1000}
+				require.NoError(t, db.Create(&user).Error)
+				token := model.Token{UserId: user.Id, Key: uuid.NewString(), RemainQuota: 1000}
+				require.NoError(t, db.Create(&token).Error)
+				info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, ForcePreConsume: true, RequestId: uuid.NewString(), IsPlayground: false}
+				info.UserSetting.BillingPreference = source + "_only"
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+				var funding FundingSource = &WalletFunding{userId: user.Id}
+				sub := model.UserSubscription{}
+				plan := model.SubscriptionPlan{}
+				if source == "subscription" {
+					plan = model.SubscriptionPlan{Title: "Recovery", TotalAmount: 2000, QuotaResetPeriod: model.SubscriptionResetNever}
+					require.NoError(t, db.Create(&plan).Error)
+					sub = model.UserSubscription{UserId: user.Id, PlanId: plan.Id, AmountTotal: 2000, AmountUsed: 70, Status: "active", EndTime: time.Now().Unix() + 3600}
+					require.NoError(t, db.Create(&sub).Error)
+					funding = &SubscriptionFunding{requestId: info.RequestId, userId: user.Id, amount: 100}
+				}
+				t.Cleanup(func() {
+					require.NoError(t, db.Where("token_id = ? OR (kind = ? AND account_id = ?)", token.Id, "wallet", user.Id).Delete(&model.BillingOperation{}).Error)
+					require.NoError(t, db.Where("request_id = ?", info.RequestId).Delete(&model.SubscriptionPreConsumeRecord{}).Error)
+					if sub.Id > 0 {
+						require.NoError(t, db.Delete(&sub).Error)
+						require.NoError(t, db.Delete(&plan).Error)
+					}
+					require.NoError(t, db.Unscoped().Delete(&token).Error)
+					require.NoError(t, db.Unscoped().Delete(&user).Error)
+				})
+				session := &BillingSession{relayInfo: info, funding: funding}
+				info.Billing = session
+				fundingTable := "users"
+				if source == "subscription" {
+					fundingTable = "user_subscriptions"
+				}
+				failed := false
+				const callback = "billing_operation_fault"
+				// Fail only the intended balance write; the durable intent remains writable.
+				require.NoError(t, db.Callback().Update().Before("gorm:update").Register(callback, func(tx *gorm.DB) {
+					if !failed {
+						return
+					}
+					if (fault == "token" || fault == "concurrent") && tx.Statement.Table == "tokens" || (fault == "funding" || fault == "refund" || fault == "reserve_settle" || fault == "reserve_refund" || fault == "admission_refund") && tx.Statement.Table == fundingTable {
+						if fault == "reserve_settle" || fault == "reserve_refund" {
+							values, ok := tx.Statement.Dest.(map[string]any)
+							if source == "wallet" {
+								if !ok {
+									return
+								}
+								expr, ok := values["quota"].(clause.Expr)
+								if !ok || expr.Vars[0].(int) >= 0 {
+									return
+								}
+							} else {
+								stored, ok := tx.Statement.Dest.(*model.UserSubscription)
+								if !ok || stored.AmountUsed >= 370 {
+									return
+								}
+							}
+						}
+						tx.AddError(errors.New("injected accounting write failure"))
+					}
+					if fault == "admission_refund" && tx.Statement.Table == "tokens" {
+						values, ok := tx.Statement.Dest.(map[string]any)
+						if !ok {
+							return
+						}
+						expr, ok := values["remain_quota"].(clause.Expr)
+						if !ok || expr.Vars[0].(int) >= 0 {
+							return
+						}
+						tx.AddError(errors.New("injected token rollback failure"))
+					}
+				}))
+				require.NoError(t, db.Callback().Create().Before("gorm:create").Register(callback, func(tx *gorm.DB) {
+					if failed && (fault == "intent" || strings.HasSuffix(fault, "admission_reply") || strings.HasSuffix(fault, "admission_rollback")) && tx.Statement.Table == "billing_operations" {
+						tx.AddError(errors.New("injected intent write failure"))
+					}
+				}))
+				t.Cleanup(func() {
+					require.NoError(t, db.Callback().Update().Remove(callback))
+					require.NoError(t, db.Callback().Create().Remove(callback))
+				})
+				if strings.HasSuffix(fault, "admission_reply") || strings.HasSuffix(fault, "admission_rollback") {
+					sqlDB, err := db.DB()
+					require.NoError(t, err)
+					pool := &billingLostReplyPool{DB: sqlDB, afterCommit: func() { failed = true }}
+					oldPool := db.Config.ConnPool
+					db.Config.ConnPool, db.Statement.ConnPool = pool, pool
+					require.NoError(t, db.Callback().Update().After("gorm:update").Register("lose_admission_reply", func(tx *gorm.DB) {
+						targetTable := fundingTable
+						if strings.HasPrefix(fault, "token_") {
+							targetTable = "tokens"
+						}
+						if tx.Statement.Table == targetTable {
+							if strings.HasSuffix(fault, "admission_rollback") {
+								pool.rollback.Store(true)
+							} else {
+								pool.lose.Store(true)
+							}
+						}
+					}))
+					apiErr := session.preConsume(ctx, 100)
+					db.Config.ConnPool, db.Statement.ConnPool = oldPool, oldPool
+					require.NoError(t, db.Callback().Update().Remove("lose_admission_reply"))
+					require.NotNil(t, apiErr)
+					failed = false
+					session = nil
+					require.NoError(t, model.RecoverBillingOperations())
+					require.NoError(t, model.RecoverBillingOperations())
+					require.NoError(t, db.First(&token, token.Id).Error)
+					assert.Equal(t, 1000, token.RemainQuota)
+					if source == "wallet" {
+						require.NoError(t, db.First(&user, user.Id).Error)
+						assert.Equal(t, 1000, user.Quota)
+					} else {
+						require.NoError(t, db.First(&sub, sub.Id).Error)
+						assert.EqualValues(t, 70, sub.AmountUsed)
+					}
+					return
+				}
+				if fault == "admission_refund" {
+					failed = true
+					require.NotNil(t, session.preConsume(ctx, 100))
+					failed = false
+					session = nil
+					require.NoError(t, model.RecoverBillingOperations())
+					require.NoError(t, model.RecoverBillingOperations())
+					require.NoError(t, db.First(&token, token.Id).Error)
+					assert.Equal(t, 1000, token.RemainQuota)
+					return
+				}
+				require.Nil(t, session.preConsume(ctx, 100))
+				want := 40
+				if fault == "reserve_insufficient" {
+					info.ImageRequestCount = 1
+					err := session.Reserve(2100)
+					var apiErr *types.NewAPIError
+					require.ErrorAs(t, err, &apiErr)
+					assert.Equal(t, http.StatusForbidden, apiErr.StatusCode)
+					assert.Equal(t, types.ErrorCodeInsufficientUserQuota, apiErr.GetErrorCode())
+					assert.Equal(t, 100, session.GetPreConsumedQuota())
+					session.Refund(ctx)
+					want = 0
+				} else if fault == "reserve_settle" || fault == "reserve_refund" {
+					// Extra funding succeeds, token admission fails, compensation fails.
+					require.NoError(t, db.Model(&token).Update("remain_quota", 10).Error)
+					failed = true
+					require.Error(t, session.Reserve(300))
+					if fault == "reserve_settle" {
+						require.Error(t, session.Settle(300))
+						want = 300
+					} else {
+						session.Refund(ctx)
+						want = 0
+					}
+				} else if fault == "refund" {
+					failed = true
+					session.Refund(ctx)
+					require.NoError(t, db.First(&token, token.Id).Error)
+					assert.Equal(t, 1000, token.RemainQuota, "funding failure must not block token refund")
+					require.Error(t, session.Settle(40))
+					want = 0
+				} else if fault == "concurrent" {
+					failed = true
+					require.Error(t, session.Settle(40))
+					failed = false
+					sqlDB, err := db.DB()
+					require.NoError(t, err)
+					if !common.UsingMainDatabase(common.DatabaseTypeSQLite) {
+						sqlDB.SetMaxOpenConns(4)
+					}
+					results := make(chan error, 2)
+					var wg sync.WaitGroup
+					wg.Go(func() { results <- session.Settle(40) })
+					wg.Go(func() { results <- model.RecoverBillingOperations() })
+					wg.Wait()
+					close(results)
+					for err := range results {
+						require.NoError(t, err)
+					}
+					sqlDB.SetMaxOpenConns(1)
+				} else if fault == "commit_reply" {
+					sqlDB, err := db.DB()
+					require.NoError(t, err)
+					pool := &billingLostReplyPool{DB: sqlDB}
+					originalPool := db.Config.ConnPool
+					db.Config.ConnPool = pool
+					db.Statement.ConnPool = pool
+					t.Cleanup(func() {
+						db.Config.ConnPool = originalPool
+						db.Statement.ConnPool = originalPool
+						_ = db.Callback().Update().Remove("lose_settlement_reply")
+					})
+					// Arm on the funding write, after the intent has been persisted.
+					require.NoError(t, db.Callback().Update().After("gorm:update").Register("lose_settlement_reply", func(tx *gorm.DB) {
+						if tx.Statement.Table == fundingTable {
+							pool.lose.Store(true)
+						}
+					}))
+					require.Error(t, session.Settle(40))
+					require.NoError(t, db.Callback().Update().Remove("lose_settlement_reply"))
+					db.Config.ConnPool = originalPool
+					db.Statement.ConnPool = originalPool
+				} else {
+					failed = true
+					require.Error(t, session.Settle(40))
+					session.Refund(ctx)
+				}
+				if fault == "funding" || fault == "token" || fault == "intent" || fault == "commit_reply" {
+					other := model.NewLogOther()
+					appendBillingInfo(info, other)
+					encoded, err := common.Marshal(other)
+					require.NoError(t, err)
+					assert.Contains(t, string(encoded), `"state":"pending_recovery"`)
+					assert.Contains(t, string(encoded), `"check_required":true`)
+				}
+				failed = false
+				// No Settle/Refund call against session is needed after this point.
+				session = nil
+				require.NoError(t, model.RecoverBillingOperations())
+				require.NoError(t, model.RecoverBillingOperations())
+				require.NoError(t, db.First(&token, token.Id).Error)
+				if fault == "reserve_settle" || fault == "reserve_refund" {
+					assert.Equal(t, 110-want, token.RemainQuota)
+				} else {
+					assert.Equal(t, 1000-want, token.RemainQuota)
+				}
+				assert.Equal(t, want, token.UsedQuota)
+				if source == "wallet" {
+					require.NoError(t, db.First(&user, user.Id).Error)
+					assert.Equal(t, 1000-want, user.Quota)
+				} else {
+					require.NoError(t, db.First(&sub, sub.Id).Error)
+					assert.EqualValues(t, 70+want, sub.AmountUsed)
+				}
+			})
+		}
+	}
+}
+
+// Simulate a lost acknowledgement after the real engine has committed.
+type billingLostReplyPool struct {
+	*sql.DB
+	lose        atomic.Bool
+	rollback    atomic.Bool
+	afterCommit func()
+}
+
+func (p *billingLostReplyPool) BeginTx(ctx context.Context, opts *sql.TxOptions) (gorm.ConnPool, error) {
+	tx, err := p.DB.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &billingLostReplyTx{Tx: tx, pool: p}, nil
+}
+
+type billingLostReplyTx struct {
+	*sql.Tx
+	pool *billingLostReplyPool
+}
+
+func (tx *billingLostReplyTx) Commit() error {
+	if tx.pool.rollback.Swap(false) {
+		if err := tx.Tx.Rollback(); err != nil {
+			return err
+		}
+		if tx.pool.afterCommit != nil {
+			tx.pool.afterCommit()
+		}
+		return errors.New("connection lost before commit")
+	}
+	if err := tx.Tx.Commit(); err != nil {
+		return err
+	}
+	if tx.pool.lose.Swap(false) {
+		if tx.pool.afterCommit != nil {
+			tx.pool.afterCommit()
+		}
+		return errors.New("commit acknowledgement lost")
+	}
+	return nil
+}
+
+func runBillingRedisRecoveryCases(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	addr := os.Getenv("TEST_BILLING_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("TEST_BILLING_REDIS_ADDR is not configured")
+	}
+	oldRedis, oldRDB, oldBatch := common.RedisEnabled, common.RDB, common.BatchUpdateEnabled
+	common.RDB = redis.NewClient(&redis.Options{Addr: addr})
+	require.NoError(t, common.RDB.Ping(context.Background()).Err())
+	common.RedisEnabled = true
+	t.Cleanup(func() {
+		require.NoError(t, common.RDB.Close())
+		common.RDB = oldRDB
+		common.RedisEnabled = oldRedis
+		common.BatchUpdateEnabled = oldBatch
+	})
+	for _, mode := range []string{"pending debit", "commit reply", "batch pending debit", "batch commit reply", "insufficient reservation", "batch insufficient reservation", "refund", "batch refund"} {
+		t.Run(mode, func(t *testing.T) {
+			common.BatchUpdateEnabled = strings.HasPrefix(mode, "batch ")
+			user := model.User{Username: "redis-" + uuid.NewString(), AffCode: uuid.NewString()[:16], Quota: 1000, AuthVersion: 1}
+			require.NoError(t, db.Create(&user).Error)
+			token := model.Token{UserId: user.Id, Key: uuid.NewString(), RemainQuota: 1000}
+			require.NoError(t, db.Create(&token).Error)
+			require.NoError(t, common.RDB.Del(context.Background(), fmt.Sprintf("user:%d", user.Id)).Err())
+			_, err := model.GetUserCache(user.Id)
+			require.NoError(t, err)
+			tokenCacheKey := "token:" + common.GenerateHMAC(token.Key)
+			require.NoError(t, common.RDB.HSet(context.Background(), tokenCacheKey, map[string]any{"Id": token.Id, "UserId": user.Id, "RemainQuota": 1000, "UsedQuota": 0}).Err())
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, ForcePreConsume: true, UserSetting: dto.UserSetting{BillingPreference: "wallet_only"}}
+			session, apiErr := NewBillingSession(ctx, info, 100)
+			require.Nil(t, apiErr)
+			require.NoError(t, db.First(&token, token.Id).Error)
+			assert.Equal(t, 900, token.RemainQuota, "admission is durable before any refund can commit")
+			assert.Equal(t, 100, token.UsedQuota)
+			want := 200
+			if strings.HasSuffix(mode, "insufficient reservation") {
+				info.ImageRequestCount = 1
+				require.Error(t, session.Reserve(1500))
+				assert.Equal(t, 100, session.GetPreConsumedQuota())
+				require.NoError(t, session.Settle(100))
+				want = 900
+			} else if strings.HasSuffix(mode, "refund") {
+				require.NoError(t, session.Settle(40))
+				want = 960
+			} else if strings.HasSuffix(mode, "pending debit") {
+				require.NoError(t, db.Callback().Update().Before("gorm:update").Register("redis_settlement_fault", func(tx *gorm.DB) {
+					if tx.Statement.Table == "tokens" {
+						tx.AddError(errors.New("token settlement unavailable"))
+					}
+				}))
+				require.Error(t, session.Settle(800))
+				_, apiErr = NewBillingSession(ctx, info, 300)
+				require.NotNil(t, apiErr, "pending debit cannot be spent again")
+				require.NoError(t, db.Callback().Update().Remove("redis_settlement_fault"))
+			} else {
+				sqlDB, err := db.DB()
+				require.NoError(t, err)
+				pool := &billingLostReplyPool{DB: sqlDB}
+				oldPool := db.Config.ConnPool
+				db.Config.ConnPool, db.Statement.ConnPool = pool, pool
+				require.NoError(t, db.Callback().Update().After("gorm:update").Register("redis_settlement_reply", func(tx *gorm.DB) {
+					if tx.Statement.Table == "users" {
+						pool.lose.Store(true)
+					}
+				}))
+				require.Error(t, session.Settle(800))
+				db.Config.ConnPool, db.Statement.ConnPool = oldPool, oldPool
+				require.NoError(t, db.Callback().Update().Remove("redis_settlement_reply"))
+			}
+			session = nil
+			require.NoError(t, model.RecoverBillingOperations())
+			require.NoError(t, model.RecoverBillingOperations())
+			requestQuota := 300
+			if want >= 900 {
+				requestQuota = 1000
+			}
+			_, apiErr = NewBillingSession(ctx, info, requestQuota)
+			require.NotNil(t, apiErr, "recovered balance cannot admit an oversized reservation")
+			require.NoError(t, db.First(&user, user.Id).Error)
+			require.NoError(t, db.First(&token, token.Id).Error)
+			assert.Equal(t, want, user.Quota)
+			assert.Equal(t, want, token.RemainQuota)
+			assert.Equal(t, 1000-want, token.UsedQuota)
+			cache, err := model.GetUserCache(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, want, cache.Quota)
+			remain, err := common.RDB.HGet(context.Background(), tokenCacheKey, "RemainQuota").Int()
+			require.NoError(t, err)
+			assert.Equal(t, want, remain)
+			require.NoError(t, db.Where("token_id = ? OR (kind = ? AND account_id = ?)", token.Id, "wallet", user.Id).Delete(&model.BillingOperation{}).Error)
+			require.NoError(t, db.Unscoped().Delete(&token).Error)
+			require.NoError(t, db.Unscoped().Delete(&user).Error)
+		})
+	}
+}
+
+// Fixtures are initialized by the published new-api image before this test.
+// Each DSN/path must refer to a disposable release-created database.
+func TestBillingReleaseDatabaseUpgrade(t *testing.T) {
+	for _, tc := range []struct {
+		kind        common.DatabaseType
+		env, logEnv string
+	}{
+		{common.DatabaseTypeSQLite, "TEST_BILLING_RELEASE_SQLITE", ""},
+		{common.DatabaseTypeMySQL, "TEST_BILLING_RELEASE_MYSQL", "TEST_BILLING_RELEASE_MYSQL_LOG"},
+		{common.DatabaseTypePostgreSQL, "TEST_BILLING_RELEASE_POSTGRES", "TEST_BILLING_RELEASE_POSTGRES_LOG"},
+	} {
+		t.Run(string(tc.kind), func(t *testing.T) {
+			dsn := os.Getenv(tc.env)
+			if dsn == "" {
+				t.Skip(tc.env + " is not configured")
+			}
+			var driver gorm.Dialector = sqlite.Open(dsn)
+			if tc.kind == common.DatabaseTypeMySQL {
+				driver = mysql.Open(dsn)
+			} else if tc.kind == common.DatabaseTypePostgreSQL {
+				driver = postgres.New(postgres.Config{DSN: dsn, PreferSimpleProtocol: true})
+			}
+			baseline, err := gorm.Open(driver, &gorm.Config{})
+			require.NoError(t, err)
+			const recordID = 90001
+			require.NoError(t, baseline.Table("users").Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "id"}}, DoUpdates: clause.Assignments(map[string]any{"id": recordID})}).Create(map[string]any{"id": recordID, "username": "upgrade-probe", "password": "!", "aff_code": "upgrade-probe", "quota": 123456, "used_quota": 321, "request_count": 7}).Error)
+			require.NoError(t, baseline.Table("tokens").Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "id"}}, DoUpdates: clause.Assignments(map[string]any{"id": recordID})}).Create(map[string]any{"id": recordID, "user_id": recordID, "key": "release-upgrade-probe", "remain_quota": 7890, "used_quota": 321}).Error)
+			baselineLog := baseline
+			if logDSN := os.Getenv(tc.logEnv); logDSN != "" {
+				var logDriver gorm.Dialector = mysql.Open(logDSN)
+				if tc.kind == common.DatabaseTypePostgreSQL {
+					logDriver = postgres.New(postgres.Config{DSN: logDSN, PreferSimpleProtocol: true})
+				}
+				baselineLog, err = gorm.Open(logDriver, &gorm.Config{})
+				require.NoError(t, err)
+			}
+			require.NoError(t, baselineLog.Table("logs").Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "id"}}, DoUpdates: clause.Assignments(map[string]any{"id": recordID})}).Create(map[string]any{"id": recordID, "user_id": recordID, "type": model.LogTypeConsume, "quota": 987, "content": "release log probe"}).Error)
+			if baselineLog != baseline {
+				logSQL, err := baselineLog.DB()
+				require.NoError(t, err)
+				require.NoError(t, logSQL.Close())
+			}
+			originalSQL, err := baseline.DB()
+			require.NoError(t, err)
+			require.NoError(t, originalSQL.Close())
+			oldDB, oldLog := model.DB, model.LOG_DB
+			oldMainType, oldLogType := common.MainDatabaseType(), common.LogDatabaseType()
+			oldMaster, oldSQLite := common.IsMasterNode, common.SQLitePath
+			common.IsMasterNode = true
+			if tc.kind == common.DatabaseTypeSQLite {
+				common.SQLitePath = dsn
+				dsn = "local"
+			}
+			t.Setenv("SQL_DSN", dsn)
+			t.Setenv("LOG_SQL_DSN", os.Getenv(tc.logEnv))
+			t.Cleanup(func() {
+				model.DB, model.LOG_DB = oldDB, oldLog
+				common.IsMasterNode, common.SQLitePath = oldMaster, oldSQLite
+				common.SetDatabaseTypes(oldMainType, oldLogType)
+			})
+			for iteration := range 2 {
+				require.NoError(t, model.InitDB())
+				require.NoError(t, model.InitLogDB())
+				var user model.User
+				var token model.Token
+				require.NoError(t, model.DB.First(&user, recordID).Error)
+				require.NoError(t, model.DB.First(&token, recordID).Error)
+				assert.Equal(t, 123456, user.Quota)
+				assert.Equal(t, 321, user.UsedQuota)
+				assert.Equal(t, 7, user.RequestCount)
+				assert.Equal(t, 7890, token.RemainQuota)
+				assert.Equal(t, 321, token.UsedQuota)
+				var log model.Log
+				require.NoError(t, model.LOG_DB.First(&log, recordID).Error)
+				assert.Equal(t, 987, log.Quota)
+				assert.Equal(t, "release log probe", log.Content)
+
+				duplicate := model.Token{UserId: recordID, Key: token.Key}
+				require.Error(t, model.DB.Create(&duplicate).Error, "token uniqueness survives migration")
+				if iteration == 1 {
+					runBillingOperationRecoveryCases(t, model.DB)
+				}
+				sqlDB, err := model.DB.DB()
+				require.NoError(t, err)
+				if model.LOG_DB != model.DB {
+					sqlLog, err := model.LOG_DB.DB()
+					require.NoError(t, err)
+					require.NoError(t, sqlLog.Close())
+				}
+				require.NoError(t, sqlDB.Close())
+			}
+		})
+	}
 }

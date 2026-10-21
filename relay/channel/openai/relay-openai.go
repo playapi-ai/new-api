@@ -118,7 +118,10 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var toolCount int
 	var usage = &dto.Usage{}
 	var lastStreamData string
-	var secondLastStreamData string // 保留倒数第二个stream data；部分兼容网关把完整usage放在倒数第二个事件
+	var usageFrame string
+	var streamErr *types.NewAPIError
+	var hasResponse bool
+	completedChoices := make(map[int]bool)
 	seenStreamToolCalls := make(map[string]struct{})
 	var streamFunctionCallNames []string
 
@@ -129,50 +132,99 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 				sr.Error(err)
 			}
 		}
-		if len(data) > 0 {
-			if lastStreamData != "" {
-				secondLastStreamData = lastStreamData
+		var chunk struct {
+			dto.ChatCompletionsStreamResponse
+			Error *types.OpenAIError `json:"error"`
+		}
+		if err := common.UnmarshalJsonStr(data, &chunk); err != nil {
+			streamErr = types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway)
+			info.StreamStatus.MarkFailed(string(streamErr.GetErrorCode()), "", http.StatusBadGateway)
+			sr.Stop(err)
+			return
+		}
+		if chunk.Error != nil {
+			streamErr = types.WithOpenAIError(*chunk.Error, http.StatusBadGateway)
+			info.StreamStatus.MarkFailed(string(streamErr.GetErrorCode()), chunk.Error.Type, http.StatusBadGateway)
+			sr.Stop(streamErr)
+			return
+		}
+		for _, choice := range chunk.Choices {
+			finished := choice.FinishReason != nil && *choice.FinishReason != ""
+			completedChoices[choice.Index] = completedChoices[choice.Index] || finished
+			if choice.Delta.GetContentString() != "" || choice.Delta.GetReasoningContent() != "" || len(choice.Delta.ToolCalls) > 0 || finished {
+				hasResponse = true
 			}
-
-			lastStreamData = data
-			observeStreamChoices(info, data, seenStreamToolCalls, &streamFunctionCallNames)
-			if err := processTokenData(info, data, &responseTextBuilder, &toolCount); err != nil {
-				logger.LogError(c, common.LogText("error processing stream token data: %s", err.Error()))
-				sr.Error(err)
+		}
+		// Compatible streams can carry legacy text, refusals, function calls,
+		// or audio without a text delta. These are output too, including when
+		// the client disconnects before a finish reason arrives.
+		var completion struct {
+			Choices []struct {
+				Text  string `json:"text"`
+				Delta struct {
+					Refusal      string               `json:"refusal"`
+					FunctionCall dto.FunctionResponse `json:"function_call"`
+					Audio        struct {
+						Data       string `json:"data"`
+						Transcript string `json:"transcript"`
+					} `json:"audio"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := common.UnmarshalJsonStr(data, &completion); err == nil {
+			for _, choice := range completion.Choices {
+				hasResponse = hasResponse || choice.Text != "" || choice.Delta.Refusal != "" ||
+					choice.Delta.FunctionCall.Name != "" || choice.Delta.FunctionCall.Arguments != "" ||
+					choice.Delta.Audio.Data != "" || choice.Delta.Audio.Transcript != ""
 			}
+		}
+		if service.ValidUsage(chunk.Usage) {
+			applyUsagePostProcessing(info, chunk.Usage, common.StringToByteSlice(data))
+			usage = dto.MergeUsageNonZero(usage, chunk.Usage)
+			containStreamUsage = true
+			usageFrame = data
+		}
+		lastStreamData = data
+		observeStreamChoices(info, data, seenStreamToolCalls, &streamFunctionCallNames)
+		if err := processTokenData(info, data, &responseTextBuilder, &toolCount); err != nil {
+			logger.LogError(c, common.LogText("error processing stream token data: %s", err.Error()))
+			sr.Error(err)
 		}
 	})
 
 	info.StreamStatus.RequireTerminal()
 
-	// 处理最后的响应
+	if streamErr != nil {
+		return nil, streamErr
+	}
+	expectedChoices := 1
+	if request, ok := info.Request.(*dto.GeneralOpenAIRequest); ok && request.N != nil {
+		expectedChoices = max(1, *request.N)
+	}
+	completed := len(completedChoices) >= expectedChoices
+	for _, finished := range completedChoices {
+		completed = completed && finished
+	}
+	// A downstream disconnect must not turn already delivered output into a
+	// free request. Upstream transport failures before completion do refund.
+	clientGone := info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone || c.Request.Context().Err() != nil
+	if !completed && !clientGone && !info.StreamStatus.IsNormalEnd() {
+		err := info.StreamStatus.EndError
+		if err == nil {
+			err = fmt.Errorf("upstream stream interrupted: %s", info.StreamStatus.EndReason)
+		}
+		info.StreamStatus.MarkFailed(string(types.ErrorCodeBadResponseBody), "", http.StatusBadGateway)
+		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponseBody, http.StatusBadGateway)
+	}
+	if !hasResponse && !containStreamUsage {
+		info.StreamStatus.MarkFailed("empty_response", "", http.StatusBadGateway)
+		return nil, types.NewOpenAIError(fmt.Errorf("upstream returned an empty stream"), types.ErrorCodeBadResponseBody, http.StatusBadGateway)
+	}
+
 	shouldSendLastResp := true
 	if err := handleLastResponse(lastStreamData, &responseId, &createAt, &systemFingerprint, &model, &usage,
 		&containStreamUsage, info, &shouldSendLastResp); err != nil {
 		logger.LogError(c, common.LogText("error handling last response: %s, lastStreamData: [%s]", err.Error(), lastStreamData))
-	}
-
-	// 部分兼容网关把完整的累计usage附在倒数第二个事件上，随后发送一个空的最后事件。
-	// 仅当最后一个事件没有有效usage时，回退到倒数第二个事件的完整快照。
-	usageFrame := lastStreamData
-	if !containStreamUsage && secondLastStreamData != "" {
-		var streamResp struct {
-			Usage *dto.Usage `json:"usage"`
-		}
-		err := common.Unmarshal([]byte(secondLastStreamData), &streamResp)
-		if err == nil && streamResp.Usage != nil &&
-			streamResp.Usage.PromptTokens > 0 &&
-			(streamResp.Usage.CompletionTokens > 0 || streamResp.Usage.TotalTokens > 0) {
-			usage = dto.MergeUsageNonZero(usage, streamResp.Usage)
-			containStreamUsage = true
-			usageFrame = secondLastStreamData
-
-			if common.DebugEnabled {
-				logger.LogDebug(c, "usage extracted from second last SSE: PromptTokens=%d, CompletionTokens=%d, TotalTokens=%d, InputTokens=%d, OutputTokens=%d",
-					usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens,
-					usage.InputTokens, usage.OutputTokens)
-			}
-		}
 	}
 
 	if info.RelayFormat == types.RelayFormatOpenAI {

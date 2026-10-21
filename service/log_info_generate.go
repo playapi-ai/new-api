@@ -187,6 +187,18 @@ func appendBillingInfo(relayInfo *relaycommon.RelayInfo, other *model.LogOther) 
 		return
 	}
 	// billing_source: "wallet" or "subscription"
+	if session, ok := relayInfo.Billing.(*BillingSession); ok {
+		session.mu.Lock()
+		if session.settlementID != "" {
+			state := "pending_recovery"
+			if session.settled {
+				state = "applied"
+			}
+			other.SetAdmin("billing_settlement", map[string]any{"operation_id": session.settlementID, "state": state, "check_required": !session.settled})
+		}
+		session.mu.Unlock()
+	}
+
 	if relayInfo.BillingSource != "" {
 		other.SetPublic("billing_source", relayInfo.BillingSource)
 	}
