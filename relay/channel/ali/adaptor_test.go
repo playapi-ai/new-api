@@ -487,3 +487,41 @@ func TestMultimodalEmbeddingResponse(t *testing.T) {
 		})
 	}
 }
+
+func TestMultimodalEmbeddingEncodingFormat(t *testing.T) {
+	const floatData = `[{"object":"embedding","index":0,"embedding":[0.25,-0.5,0]},{"object":"embedding","index":1,"embedding":[1,-2.5,0.1]}]`
+	for _, tc := range []struct {
+		name, format, wantData string
+	}{
+		{name: "default float", wantData: floatData},
+		{name: "explicit float", format: "float", wantData: floatData},
+		{name: "base64 float32 little endian", format: "base64", wantData: `[{"object":"embedding","index":0,"embedding":"AACAPgAAAL8AAAAA"},{"object":"embedding","index":1,"embedding":"AACAPwAAIMDNzMw9"}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := &dto.EmbeddingRequest{Model: "qwen3-vl-embedding", Input: "a cat", EncodingFormat: tc.format}
+			info := &relaycommon.RelayInfo{
+				Request: request, RelayMode: constant.RelayModeEmbeddings, RelayFormat: types.RelayFormatEmbedding,
+				ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: request.Model},
+			}
+			adaptor := &Adaptor{}
+			_, err := adaptor.ConvertEmbeddingRequest(nil, info, *request)
+			require.NoError(t, err)
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			response := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
+				`{"output":{"embeddings":[{"index":0,"embedding":[0.25,-0.5,0]},{"index":1,"embedding":[1,-2.5,0.1]}]},"usage":{"input_tokens":2}}`))}
+
+			usage, apiErr := adaptor.DoResponse(c, response, info)
+
+			require.Nil(t, apiErr)
+			assert.JSONEq(t, tc.wantData, gjson.GetBytes(recorder.Body.Bytes(), "data").Raw)
+			wantUsage := &dto.Usage{PromptTokens: 2, TotalTokens: 2, PromptTokensDetails: dto.InputTokenDetails{TextTokens: 2}}
+			assert.Equal(t, wantUsage, usage, "output encoding must not change billable usage")
+			var wire struct {
+				Usage dto.Usage `json:"usage"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &wire))
+			assert.Equal(t, *wantUsage, wire.Usage)
+		})
+	}
+}

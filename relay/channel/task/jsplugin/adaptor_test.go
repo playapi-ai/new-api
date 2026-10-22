@@ -1706,28 +1706,49 @@ func TestSubmitContextOriginTasksNilDataOnInvalidJSON(t *testing.T) {
 func TestSubmitContextExposesClientHeadersWithoutCredentials(t *testing.T) {
 	plugin, err := pluginruntime.NewRegistry().Register(mockPlugin, pluginruntime.Options{})
 	require.NoError(t, err)
-	adaptor := New(plugin)
-	info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
-	adaptor.Init(info)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	c.Request = httptest.NewRequest(http.MethodPost, "/vendor/v1/jobs", nil)
-	c.Request.Header.Set("Content-Type", "application/json")
-	c.Request.Header.Set("TypeSafe-Danger-Zone-Long-Context", "true")
-	c.Request.Header.Add("X-Trace", "first")
-	c.Request.Header.Add("X-Trace", "second")
-	for _, name := range []string{"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key", "Mj-Api-Secret"} {
-		c.Request.Header.Set(name, "gateway-secret")
+	for _, tc := range []struct {
+		name    string
+		headers http.Header
+	}{
+		{name: "ordinary headers"},
+		{name: "authentication subprotocol", headers: http.Header{
+			"Sec-Websocket-Protocol": {"responses, openai-insecure-api-key.test-gateway-key"},
+		}},
+		{name: "repeated subprotocol headers", headers: http.Header{
+			"Sec-Websocket-Protocol": {"responses", "openai-insecure-api-key.test-gateway-key"},
+		}},
+		{name: "mixed case header name", headers: http.Header{
+			"sEc-WeBsOcKeT-pRoToCoL": {"openai-insecure-api-key.test-gateway-key"},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			adaptor := New(plugin)
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelBaseUrl: "https://provider.example"}, TaskRelayInfo: &relaycommon.TaskRelayInfo{}}
+			adaptor.Init(info)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/vendor/v1/jobs", nil)
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Request.Header.Set("TypeSafe-Danger-Zone-Long-Context", "true")
+			c.Request.Header.Add("X-Trace", "first")
+			c.Request.Header.Add("X-Trace", "second")
+			for _, name := range []string{"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key", "Mj-Api-Secret"} {
+				c.Request.Header.Set(name, "gateway-secret")
+			}
+			for name, values := range tc.headers {
+				c.Request.Header[name] = values
+			}
+
+			headers := adaptor.submitContext(c, info)["requestHeaders"]
+
+			assert.Equal(t, map[string]string{
+				"Content-Type":                      "application/json",
+				"Accept":                            "",
+				"Typesafe-Danger-Zone-Long-Context": "true",
+				"X-Trace":                           "first",
+			}, headers)
+			assert.Equal(t, headers, adaptor.submitContext(nil, info)["requestHeaders"], "hooks without a client request see the submission headers")
+		})
 	}
-
-	headers := adaptor.submitContext(c, info)["requestHeaders"]
-
-	assert.Equal(t, map[string]string{
-		"Content-Type":                      "application/json",
-		"Accept":                            "",
-		"Typesafe-Danger-Zone-Long-Context": "true",
-		"X-Trace":                           "first",
-	}, headers)
-	assert.Equal(t, headers, adaptor.submitContext(nil, info)["requestHeaders"], "hooks without a client request see the submission headers")
 }
 
 func TestSubmitContextNormalizesRequestBodyOnEveryCall(t *testing.T) {

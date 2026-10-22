@@ -1,8 +1,11 @@
 package ali
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strings"
 
@@ -148,12 +151,23 @@ func MultimodalEmbeddingHandler(c *gin.Context, resp *http.Response, info *relay
 		}, http.StatusInternalServerError), nil
 	}
 
-	data := make([]dto.EmbeddingResponseItem, 0, len(aliResponse.Output.Embeddings))
+	request, _ := info.Request.(*dto.EmbeddingRequest)
+	encodeBase64 := request != nil && request.EncodingFormat == "base64"
+	data := make([]dto.FlexibleEmbeddingResponseItem, 0, len(aliResponse.Output.Embeddings))
 	for _, embedding := range aliResponse.Output.Embeddings {
-		data = append(data, dto.EmbeddingResponseItem{
+		var vector any = embedding.Embedding
+		if encodeBase64 {
+			// OpenAI-compatible base64 embeddings contain little-endian float32s.
+			encoded := make([]byte, 4*len(embedding.Embedding))
+			for i, value := range embedding.Embedding {
+				binary.LittleEndian.PutUint32(encoded[4*i:], math.Float32bits(float32(value)))
+			}
+			vector = base64.StdEncoding.EncodeToString(encoded)
+		}
+		data = append(data, dto.FlexibleEmbeddingResponseItem{
 			Object:    "embedding",
 			Index:     embedding.Index,
-			Embedding: embedding.Embedding,
+			Embedding: vector,
 		})
 	}
 
@@ -179,7 +193,7 @@ func MultimodalEmbeddingHandler(c *gin.Context, resp *http.Response, info *relay
 	}
 	usage.TotalTokens = usage.PromptTokens
 
-	embeddingResponse := dto.EmbeddingResponse{
+	embeddingResponse := dto.FlexibleEmbeddingResponse{
 		Object: "list",
 		Data:   data,
 		Model:  info.UpstreamModelName,

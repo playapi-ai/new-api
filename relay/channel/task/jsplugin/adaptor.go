@@ -100,7 +100,11 @@ var taskArtifactKeyPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~-]{0,1
 
 // gatewayCredentialHeaders carry the client's gateway credentials. Driver
 // hooks receive every other request header.
-var gatewayCredentialHeaders = []string{"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key", "Mj-Api-Secret"}
+var gatewayCredentialHeaders = []string{
+	"Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Goog-Api-Key", "Mj-Api-Secret",
+	// Canonical spelling; TokenAuth also accepts a gateway key in this header.
+	"Sec-Websocket-Protocol",
+}
 
 const maxTaskArtifacts = 64
 
