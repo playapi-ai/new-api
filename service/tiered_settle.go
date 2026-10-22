@@ -8,6 +8,7 @@ import (
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	hosttypes "github.com/QuantumNous/new-api/types"
 	"github.com/gin-gonic/gin"
 )
 
@@ -23,17 +24,21 @@ type TieredResultWrapper = billingexpr.TieredResult
 // include all sub-categories (cache, image, audio). Claude-format APIs
 // report them as text-only. This function normalizes to text-only when
 // sub-categories are separately priced.
+//
+// OpenAI 12h writes without their own price fall back to twice the short
+// write price. Claude retains the existing opt-in cache bucket pricing.
 func BuildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVars map[string]bool) billingexpr.TokenParams {
 	p := float64(usage.PromptTokens)
 	c := float64(usage.CompletionTokens)
 	cr := float64(usage.PromptTokensDetails.CachedTokens)
-	cc5m := float64(usage.PromptTokensDetails.CacheCreationTokensTotal())
+	cc := float64(usage.PromptTokensDetails.CacheCreationTokensTotal())
 	cc1h := float64(0)
+	cc12h := float64(0)
 
 	if isClaudeUsageSemantic {
 		cc1h = max(float64(usage.ClaudeCacheCreation1hTokens), 0)
 		// Preserve aggregate-only usage and any unassigned standard-TTL writes.
-		cc5m = max(float64(usage.ClaudeCacheCreation5mTokens), cc5m-cc1h, 0)
+		cc = max(float64(usage.ClaudeCacheCreation5mTokens), cc-cc1h, 0)
 	}
 
 	img := float64(usage.PromptTokensDetails.ImageTokens)
@@ -77,17 +82,17 @@ func BuildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVa
 	// Claude: input_tokens is text-only, so add cache read + cache creation.
 	inputLen := p
 	if isClaudeUsageSemantic {
-		inputLen = p + cr + cc5m + cc1h
+		inputLen = p + cr + cc + cc1h
 	}
 
 	if isClaudeUsageSemantic {
-		// Anthropic input excludes cache reads. When cr has no separate
-		// price, merge those tokens into the input category instead.
+		// Anthropic input excludes cache reads and writes. When they have no
+		// separate price, merge those tokens into the input category instead.
 		if !usedVars["cr"] {
 			p += cr
 		}
 		if !usedVars["cc"] {
-			p += cc5m
+			p += cc
 		}
 		if !usedVars["cc1h"] {
 			p += cc1h
@@ -96,8 +101,24 @@ func BuildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVa
 		if usedVars["cr"] {
 			p -= cr
 		}
+		// prompt_tokens counts every cache write once. A 12h write without
+		// its own price joins cc at twice its count; ccTokens keeps the real
+		// count that cc takes out of p, and an unpriced cc leaves p the extra.
+		cc12h = float64(usage.PromptTokensDetails.CacheWrite12hTokens())
+		cc -= cc12h
+		ccTokens := cc
+		if usedVars["cc12h"] {
+			p -= cc12h
+		} else {
+			ccTokens += cc12h
+			cc += cc12h * hosttypes.OpenAICacheCreation12hMultiplier
+			cc12h = 0
+		}
 		if usedVars["cc"] {
-			p -= cc5m
+			p -= ccTokens
+		} else {
+			p += cc - ccTokens
+			cc = 0
 		}
 		if usedVars["cc1h"] {
 			p -= cc1h
@@ -133,8 +154,9 @@ func BuildTieredTokenParams(usage *dto.Usage, isClaudeUsageSemantic bool, usedVa
 		C:     c,
 		Len:   inputLen,
 		CR:    cr,
-		CC:    cc5m,
+		CC:    cc,
 		CC1h:  cc1h,
+		CC12h: cc12h,
 		Img:   img,
 		ImgCR: imgCR,
 		ImgO:  imgO,
