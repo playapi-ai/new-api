@@ -9,7 +9,7 @@ set -euo pipefail
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   echo "Usage: $0 [tag] (default: NEW_API_IMAGE_TAG from environment/.env, then latest)"
-  echo "Image: ghcr.io/playapiai/new-api"
+  echo "Image: ghcr.io/playapi-ai/new-api"
   echo "Public image: no registry login or token is required."
   echo "Application settings: docker-compose.yml; see .env.example for deployment options."
   exit 0
@@ -72,7 +72,7 @@ export NEW_API_IMAGE_TAG="$tag"
 compose=(docker compose -f "$project_root/docker-compose.yml" -f "$project_root/docker-compose.ghcr.yml")
 "${compose[@]}" config --quiet
 
-echo "Pulling ghcr.io/playapiai/new-api:$tag ..."
+echo "Pulling ghcr.io/playapi-ai/new-api:$tag ..."
 # Refresh the application image; download dependency images only if missing.
 # Finish all pulls before changing running containers.
 "${compose[@]}" pull new-api
@@ -83,4 +83,4 @@ if ! "${compose[@]}" up -d --no-build --pull never --wait --wait-timeout 180; th
   exit 1
 fi
 "${compose[@]}" ps
-echo "Deployed ghcr.io/playapiai/new-api:$tag. The default HTTP port is 3000."
+echo "Deployed ghcr.io/playapi-ai/new-api:$tag. The default HTTP port is 3000."

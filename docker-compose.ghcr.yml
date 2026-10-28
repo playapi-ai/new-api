@@ -1,4 +1,4 @@
 # Use with docker-compose.yml, or run ./deploy-ghcr.sh [tag].
 services:
   new-api:
-    image: ghcr.io/playapiai/new-api:${NEW_API_IMAGE_TAG:-latest}
+    image: ghcr.io/playapi-ai/new-api:${NEW_API_IMAGE_TAG:-latest}
