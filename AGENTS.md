@@ -24,6 +24,15 @@ This is an AI API gateway/proxy built with Go. It aggregates 40+ upstream AI pro
 - JavaScript task plugins live in `plugins/tasks/`, run through `pkg/jsplugin/`, and integrate with host task polling and settlement.
 - `web/` is the React frontend (see `web/AGENTS.md`); `electron/` is the desktop wrapper.
 
+## Fork Repository, Build, and Deployment
+
+- Fork repository: `https://github.com/playapi-ai/new-api`, default branch `main`. Run Git, build, and deployment commands from the checkout containing this file.
+- Production image publishing is manual: run `.github/workflows/docker-publish-ghcr.yml` (`Publish fork image to GHCR`) on the intended ref. It builds the selected commit with `Dockerfile` and publishes `ghcr.io/playapi-ai/new-api:latest` plus `fork-<run-id>-<attempt>-<sha12>`; the current fork workflow targets **linux/amd64 only**.
+- `Dockerfile` builds `web/dist` with Bun 1.4.0, then embeds it in the Go 1.26.10 binary with the moejs PGO profile. Root builds require both local modules, `relaykit/` and `tokenkit/`; keep their module files in the Docker build context.
+- Deploy the fork with `./deploy-ghcr.sh [tag]`. This combines `docker-compose.yml` and `docker-compose.ghcr.yml`, pulls images, then waits for startup. Running only `docker compose up -d` uses the upstream image from the base Compose file.
+- Deployment requires Docker with Compose v2. Tag precedence is command argument, `NEW_API_IMAGE_TAG` in the environment, `.env`, then `latest`. Application settings belong in `docker-compose.yml`; `.env` deployment settings are not automatically injected into the container.
+- Local frontend/backend development uses `make dev` (Docker backend and Bun dev server), with `make dev-api-rebuild` after backend changes. For a native backend, run `make build-web` before `go run .` because the binary embeds `web/dist`.
+
 ## Internationalization (i18n)
 
 ### Backend (`i18n/`)

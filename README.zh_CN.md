@@ -162,6 +162,8 @@ New API 是面向应用、Agent 和团队的自托管 AI 网关。将不同厂�
 
 ## 快速开始
 
+此 Fork 的镜像构建与部署请参阅[当前 Fork：GHCR 构建与部署](#当前-forkghcr-构建与部署)。
+
 ### 使用 Docker 本地体验
 
 以下命令使用 SQLite 启动单实例，仅监听本机端口：
@@ -203,6 +205,35 @@ curl --fail-with-body http://localhost:3000/v1/responses \
 <a id="deployment"></a>
 
 ## 部署与运维
+
+### 当前 Fork：GHCR 构建与部署
+
+当前维护仓库为 [playapi-ai/new-api](https://github.com/playapi-ai/new-api)。此 Fork 的发布镜像为 `ghcr.io/playapi-ai/new-api`，当前仅构建 **linux/amd64**。
+
+```bash
+git clone https://github.com/playapi-ai/new-api.git
+cd new-api
+```
+
+在 GitHub Actions 中手动运行 [Publish fork image to GHCR](https://github.com/playapi-ai/new-api/actions/workflows/docker-publish-ghcr.yml)，选择要发布的分支。工作流使用 [Dockerfile](./Dockerfile) 编译所选提交：Bun 1.4.0 构建前端，Go 1.26.10 嵌入前端产物并使用 moejs 的 PGO profile 构建后端，随后推送 `latest` 和 `fork-<run-id>-<attempt>-<sha12>` 两种标签。普通代码推送不会触发此镜像发布工作流。
+
+首次部署前，按下方说明修改 `docker-compose.yml` 中的应用配置及示例密码，然后执行：
+
+```bash
+./deploy-ghcr.sh
+# 固定版本时，将下面的占位符替换为工作流输出的完整标签：
+./deploy-ghcr.sh 'fork-<run-id>-<attempt>-<sha12>'
+```
+
+固定版本命令中的标签需替换后再执行。标签优先级为：命令参数 → 环境变量 `NEW_API_IMAGE_TAG` → `.env` 中的同名变量 → `latest`。脚本要求 Docker 和 Compose v2，合并基础配置与 [GHCR 覆盖配置](./docker-compose.ghcr.yml)，先拉取镜像再启动，并等待就绪检查。公开镜像无需仓库登录。
+
+应用环境变量在 `docker-compose.yml` 中配置；`.env` 中的部署标签不会将应用配置自动注入容器。查看此部署的日志时同样使用两个配置文件：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml logs -f new-api
+```
+
+需要本地从源码构建生产镜像时，在仓库根目录执行 `docker build --platform linux/amd64 -t new-api:local .`。构建上下文须包含 `web/`、`relaykit/` 和 `tokenkit/`。下方保留上游镜像的部署示例；只运行 `docker compose up -d` 会使用基础配置中的上游镜像。
 
 ### Docker Compose
 

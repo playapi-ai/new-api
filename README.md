@@ -162,6 +162,8 @@ This README describes the current source tree. Check the release notes for the v
 
 ## Quick start
 
+For this fork's image build and deployment, see [Current fork: GHCR build and deployment](#current-fork-ghcr-build-and-deployment).
+
 ### Try locally with Docker
 
 This starts a single instance with SQLite and binds it to localhost:
@@ -203,6 +205,35 @@ curl --fail-with-body http://localhost:3000/v1/responses \
 <a id="deployment"></a>
 
 ## Deployment
+
+### Current fork: GHCR build and deployment
+
+The maintained fork is [playapi-ai/new-api](https://github.com/playapi-ai/new-api). Its image is `ghcr.io/playapi-ai/new-api`; the fork publishing workflow currently builds **linux/amd64 only**.
+
+```bash
+git clone https://github.com/playapi-ai/new-api.git
+cd new-api
+```
+
+Manually run [Publish fork image to GHCR](https://github.com/playapi-ai/new-api/actions/workflows/docker-publish-ghcr.yml) in GitHub Actions and select the branch to publish. The workflow builds the selected commit with [Dockerfile](./Dockerfile): Bun 1.4.0 builds the frontend, then Go 1.26.10 embeds it and builds the backend with the moejs PGO profile. It publishes `latest` and `fork-<run-id>-<attempt>-<sha12>` tags. Ordinary pushes do not trigger this image publishing workflow.
+
+Before the first deployment, edit the application settings and example passwords in `docker-compose.yml` as described below, then run:
+
+```bash
+./deploy-ghcr.sh
+# To pin a version, replace the placeholder with the full tag from the workflow:
+./deploy-ghcr.sh 'fork-<run-id>-<attempt>-<sha12>'
+```
+
+Replace the placeholder before running the version-pinning command. Tag precedence is command argument, environment variable `NEW_API_IMAGE_TAG`, the same variable in `.env`, then `latest`. The script requires Docker with Compose v2, combines the base configuration with the [GHCR override](./docker-compose.ghcr.yml), pulls images before starting containers, and waits for readiness checks. The public image requires no registry login.
+
+Configure application environment variables in `docker-compose.yml`; deployment settings in `.env` do not automatically inject application settings into containers. Use both configuration files when viewing this deployment's logs:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.ghcr.yml logs -f new-api
+```
+
+To build a production image locally, run `docker build --platform linux/amd64 -t new-api:local .` from the repository root. Keep `web/`, `relaykit/`, and `tokenkit/` in the build context. The upstream-image deployment example is retained below; running only `docker compose up -d` uses the upstream image in the base configuration.
 
 ### Docker Compose
 
